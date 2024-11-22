@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  check-version:
+    name: Check Nightly Version
+    runs-on: ubuntu-latest
+    outputs:
+      RELEASE: ${{ steps.export.outputs.RELEASE }}
+      TAG: ${{ steps.export.outputs.TAG }}
+
+    steps:
+    - name: Update rust toolchain
+      run: rustup update
+
+    - name: Install nightly
+      run: rustup toolchain install nightly
+
+    - name: Retrieve nightly version
+      run: |
+        {
+          echo 'VERSION<<EOF'
+          rustup +toolchain check | \
+            grep 'nightly' | \
+            grep -E '[0-9]+\.[0-9]+\.[0-9]+-nightly' -o
+          echo 'EOF'
+        } >> "$GITHUB_ENV"
+
+    - name: Retrieve nightly commit
+      run: |
+        {
+          echo 'COMMIT<<EOF'
+          rustup +toolchain check | \
+            grep 'nightly' | \
+            grep -E '[a-f0-9]{9}' -o
+          echo 'EOF'
+        } >> "$GITHUB_ENV"
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine version
+      run: echo "TAG=v${VERSION}-${COMMIT}" >> "$GITHUB_ENV"
+       
+    - name: Check for tag
+      id: checkTag
+      run: |
+        if git show-ref --tags --verify --quiet "refs/tags/${TAG}"; then
+          echo "Version already exists no release needed"
+          echo "RELEASE=false" >> "$GITHUB_ENV"
+        else
+          echo "New version available, starting release for ${TAG}"
+          echo "RELEASE=true" >> "$GITHUB_ENV"
+        fi
+
+    - name: Export job outputs
+      id: export
+      run: |
+        echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+        echo "RELEASE=$RELEASE" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build and Release
+    needs: check-version
+    if: ${{ needs.check-version.outputs.RELEASE == 'true' }} || ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: cargo-leptos-builder-musl
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/khanhtimn/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ needs.check-version.outputs.TAG }},enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+          type=raw,value=latest
+
+    - name: Log into container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.CONTAINER_REGISTRY_TOKEN }}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v1
+      with: 
+        body: "Rebuilding docker container to keep up with rust nightly release"
+        name: Release ${{ needs.check-version.outputs.TAG }}
+        tag_name: ${{ needs.check-version.outputs.TAG }}
+        prerelease: true
